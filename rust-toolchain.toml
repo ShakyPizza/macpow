@@ -1,0 +1,10 @@
+# Pin the toolchain to "stable" so local `cargo`, `cargo clippy`, and
+# `cargo fmt` invocations use exactly the same Rust version that CI does
+# (the `dtolnay/rust-toolchain@stable` action in .github/workflows/ci.yml).
+#
+# Without this, a developer on an older `stable` could pass clippy locally
+# while CI fails on a new lint that was promoted in a more recent release.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

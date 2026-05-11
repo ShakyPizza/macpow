@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/k06a/macpow/actions/workflows/ci.yml/badge.svg)](https://github.com/k06a/macpow/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/macpow)](https://crates.io/crates/macpow)
-[![Homebrew](https://img.shields.io/badge/homebrew-v0.1.18-orange?logo=homebrew)](https://github.com/k06a/homebrew-tap)
+[![Homebrew](https://img.shields.io/badge/homebrew-v0.1.19-orange?logo=homebrew)](https://github.com/k06a/homebrew-tap)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple)](https://github.com/k06a/macpow)
 
@@ -201,42 +201,71 @@ If a new chip isn't detected correctly, run `macpow --dump` to see the raw IORep
 
 ## Release checklist
 
+> **Toolchain pinning.** The repo ships a `rust-toolchain.toml` that pins
+> `stable`, matching `dtolnay/rust-toolchain@stable` in CI. Run
+> `rustup update stable` before each release so local clippy/fmt see the
+> same lints CI does — newly-promoted clippy lints have caused CI failures
+> after `cargo publish` already uploaded the broken version (immutable),
+> so this step is non-optional.
+
 ```bash
+# 0. Make sure the toolchain matches CI exactly
+rustup update stable
+rustc --version    # note the version; CI is on the same `stable`
+
 # 1. Bump version
 vim Cargo.toml                        # update version = "X.Y.Z"
 
-# 2. Build and verify
-cargo build --release
+# 2. Build, lint, test — must all pass before the version bump commit
 cargo fmt --check                     # formatting clean
-# Clippy: same flags as .github/workflows/ci.yml (plain `cargo clippy -D warnings` is stricter and fails)
+# Clippy: copy this command verbatim from .github/workflows/ci.yml.
+# CI does NOT pass --all-targets, so neither do we — adding it pulls in
+# benches/examples that CI ignores and would block the release.
 cargo clippy -- -D warnings -A clippy::field_reassign_with_default -A clippy::manual_c_str_literals -A clippy::manual_clamp -A clippy::manual_range_contains -A clippy::missing_safety_doc -A clippy::needless_range_loop
 cargo test                            # all tests pass
+cargo build --release                 # final binary build
 
-# 3. Update Homebrew badge in README.md
+# 3. Dry-run the publish so any cargo-side issues show up before tagging
+cargo publish --dry-run
+
+# 4. Update Homebrew badge in README.md
 #    Change: homebrew-vX.Y.Z in the badge URL
 
-# 4. Commit, tag, push
+# 5. Commit, tag, push
 git add -A
 git commit -m "Bump version to X.Y.Z"
 git tag vX.Y.Z
 git push origin main --tags
 # CI will auto-create GitHub Release with binary
 
-# 5. Publish to crates.io
-cargo publish --dry-run
+# 6. Publish to crates.io  (immutable — only after CI is green!)
 cargo publish
 
-# 6. Update Homebrew tap (via PR to trigger bottle building)
+# 7. Update Homebrew tap (via PR to trigger bottle building)
 curl -sL https://github.com/k06a/macpow/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
 # Update url + sha256 in homebrew-tap/Formula/macpow.rb
 cd ../homebrew-tap
+git checkout main && git pull
 git checkout -b update-macpow-X.Y.Z
-git add Formula/macpow.rb
-git commit -m "Update macpow to X.Y.Z"
+# edit Formula/macpow.rb (url + sha256 only — bottle block is auto-rewritten)
+git commit -am "Update macpow to X.Y.Z"
 git push origin update-macpow-X.Y.Z
 # Create PR, wait for CI to build bottles, then add label "pr-pull"
 # publish.yml will upload bottles and merge the PR
+
+# 8. Update conda-forge feedstock
+cd ../macpow-feedstock
+git checkout main && git pull origin main
+git checkout -b bump-X.Y.Z
+# edit recipe/recipe.yaml: bump `version:` and update `sha256:` (same value as step 7)
+git commit -am "macpow vX.Y.Z"
+git push fork bump-X.Y.Z   # fork remote, since origin is conda-forge upstream
+# Open PR against conda-forge/macpow-feedstock from your fork branch
 ```
+
+If CI fails AFTER you ran `cargo publish` (step 6), that crates.io version
+is immutable. Yank it (`cargo yank --version X.Y.Z`) and bump the patch
+number — don't try to force-push the tag.
 
 ## Contributing
 

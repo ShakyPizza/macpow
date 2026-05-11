@@ -121,10 +121,8 @@ fn run_tui(rx: mpsc::Receiver<Metrics>) -> Result<()> {
             terminal.draw(|f| app.draw(f))?;
             if event::poll(Duration::from_millis(app.poll_interval_ms()))? {
                 match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if app.handle_key(key) {
-                            break;
-                        }
+                    Event::Key(key) if key.kind == KeyEventKind::Press && app.handle_key(key) => {
+                        break;
                     }
                     Event::Mouse(mouse) => {
                         app.handle_mouse(mouse);
