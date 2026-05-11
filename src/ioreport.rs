@@ -462,6 +462,12 @@ impl IOReportSampler {
                 ("Energy Model", None),
                 ("CPU Stats", Some("CPU Core Performance States")),
                 ("GPU Stats", Some("GPU Performance States")),
+                // AppleARMBacklight publishes live backlight metrics here:
+                //   playback backlight factors report → MIE factor, DPB factor
+                //   brightness report                 → MilliNits value, MicroAmps value,
+                //                                       UncalMilliNits value, UserBrightness value,
+                //                                       RawBrightness value
+                ("backlight report", None),
             ];
 
             let mut merged: CFDictionaryRef = ptr::null();
@@ -554,7 +560,11 @@ impl IOReportSampler {
                         .unwrap_or_default();
                     let unit = cf_utils::cfstring_to_string(IOReportChannelGetUnitLabel(ch))
                         .unwrap_or_default();
-                    println!("{:<20} {:<40} {:<30} {}", group, subgroup, name, unit);
+                    let val = IOReportSimpleGetIntegerValue(ch, 0);
+                    println!(
+                        "{:<20} {:<40} {:<30} {:<8} {}",
+                        group, subgroup, name, unit, val
+                    );
                 }
                 println!("\n--- DVFS frequency tables ---");
                 println!("E-CPU freqs (MHz): {:?}", self.ecpu_freqs);
@@ -875,6 +885,73 @@ impl IOReportSampler {
             soc.compute_total();
             Ok(soc)
         }
+    }
+
+    /// Read the current backlight snapshot from a sample, no delta needed.
+    /// All channels are absolute readings (factors and raw measurements), so we
+    /// can read directly from the sample dictionary without computing a delta.
+    pub fn parse_backlight(&self, cur: &Sample) -> BacklightSample {
+        let mut bl = BacklightSample::default();
+        unsafe {
+            let channels_arr = cf_utils::cfdict_get(cur.inner, "IOReportChannels") as CFArrayRef;
+            if channels_arr.is_null() {
+                return bl;
+            }
+            let n = cf_utils::cfarray_len(channels_arr);
+            for i in 0..n {
+                let ch = cf_utils::cfarray_get(channels_arr, i) as CFDictionaryRef;
+                let group =
+                    cf_utils::cfstring_to_string(IOReportChannelGetGroup(ch)).unwrap_or_default();
+                if group != "backlight report" {
+                    continue;
+                }
+                let name = cf_utils::cfstring_to_string(IOReportChannelGetChannelName(ch))
+                    .unwrap_or_default();
+                let val = IOReportSimpleGetIntegerValue(ch, 0);
+                match name.as_str() {
+                    "DPB factor" => bl.dpb_factor_raw = val,
+                    "MIE factor" => bl.mie_factor_raw = val,
+                    "MicroAmps value" => bl.microamps = val,
+                    "MilliNits value" => bl.millinits = val,
+                    "UncalMilliNits value" => bl.uncal_millinits = val,
+                    "UserBrightness value" => bl.user_brightness = val,
+                    "RawBrightness value" => bl.raw_brightness = val,
+                    _ => {}
+                }
+            }
+        }
+        bl
+    }
+}
+
+/// Snapshot of `AppleARMBacklight` IOReport channels.
+///
+/// Both `*_factor_raw` fields are 16.16 fixed-point: divide by 65536 to get a
+/// floating multiplier. `dpb_factor_raw == 65536` means "no HDR boost requested"
+/// (factor 1.0); higher values indicate active EDR boost on HDR-capable panels.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BacklightSample {
+    /// Display Power Boost factor — raw 16.16 fixed-point.
+    /// `65536` = 1.0 (no boost), `> 65536` = HDR pipeline engaged.
+    pub dpb_factor_raw: i64,
+    /// Maximum Image Energy factor (panel-side throttling) — raw 16.16 fixed-point.
+    pub mie_factor_raw: i64,
+    /// Backlight LED current in microamperes.
+    pub microamps: i64,
+    /// Calibrated brightness in millinits (e.g. 381794 = 381.79 nits).
+    pub millinits: i64,
+    /// Uncalibrated brightness in millinits (raw nominal).
+    pub uncal_millinits: i64,
+    /// User-controlled brightness slider position (0 = off, 65536 = max).
+    pub user_brightness: i64,
+    /// Raw register value driving the backlight PWM/LED.
+    pub raw_brightness: i64,
+}
+
+impl BacklightSample {
+    /// `DPB factor` decoded as a float multiplier (1.0 = no boost).
+    pub fn dpb_factor(&self) -> f32 {
+        self.dpb_factor_raw as f32 / 65536.0
     }
 }
 

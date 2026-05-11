@@ -39,7 +39,20 @@ extern "C" {
     fn CGDisplayPixelsWide(display: u32) -> usize;
     fn CGDisplayPixelsHigh(display: u32) -> usize;
     fn CGDisplayScreenSize(display: u32) -> CGSize;
+    fn CGDisplayCopyDisplayMode(display: u32) -> CGDisplayModeRef;
+    fn CGDisplayCopyAllDisplayModes(
+        display: u32,
+        options: core_foundation_sys::dictionary::CFDictionaryRef,
+    ) -> core_foundation_sys::array::CFArrayRef;
+    fn CGDisplayModeGetRefreshRate(mode: CGDisplayModeRef) -> f64;
+    fn CGDisplayModeRelease(mode: CGDisplayModeRef);
 }
+
+#[repr(C)]
+struct CGDisplayMode {
+    _private: [u8; 0],
+}
+type CGDisplayModeRef = *mut CGDisplayMode;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -55,6 +68,36 @@ static DISPLAY_BRIGHTNESS_FN: std::sync::OnceLock<
 static DISPLAY_LINEAR_BRIGHTNESS_FN: std::sync::OnceLock<
     Option<unsafe extern "C" fn(u32, *mut f32) -> i32>,
 > = std::sync::OnceLock::new();
+
+/// CoreDisplay private API for reading the active Reference Mode (Display Preset).
+/// These are not in any public header but exported as plain C from
+/// `/System/Library/Frameworks/CoreDisplay.framework/CoreDisplay`.
+type CoreDisplayGetActivePresetIndex = unsafe extern "C" fn(u32) -> i32;
+type CoreDisplayCopyPreset = unsafe extern "C" fn(u32, i32) -> CFDictionaryRef;
+static CD_GET_ACTIVE_PRESET_FN: std::sync::OnceLock<Option<CoreDisplayGetActivePresetIndex>> =
+    std::sync::OnceLock::new();
+static CD_COPY_PRESET_FN: std::sync::OnceLock<Option<CoreDisplayCopyPreset>> =
+    std::sync::OnceLock::new();
+
+fn load_core_display_fn<T: Copy>(sym_name: &[u8]) -> Option<T> {
+    use std::ffi::CStr;
+    unsafe {
+        let path = CStr::from_bytes_with_nul_unchecked(
+            b"/System/Library/Frameworks/CoreDisplay.framework/CoreDisplay\0",
+        );
+        let handle = libc::dlopen(path.as_ptr(), libc::RTLD_LAZY);
+        if handle.is_null() {
+            return None;
+        }
+        let sym_cstr = CStr::from_bytes_with_nul_unchecked(sym_name);
+        let sym = libc::dlsym(handle, sym_cstr.as_ptr());
+        if sym.is_null() {
+            return None;
+        }
+        // Don't dlclose — keep the library loaded for the process lifetime
+        Some(*(&sym as *const *mut libc::c_void as *const T))
+    }
+}
 
 fn load_display_brightness_fn() -> Option<unsafe extern "C" fn(u32, *mut f32) -> i32> {
     load_display_services_fn(b"DisplayServicesGetBrightness\0")
@@ -120,53 +163,105 @@ pub fn read_display_linear_brightness() -> Option<f32> {
     }
 }
 
-/// Read EDR (Extended Dynamic Range) headroom via NSScreen in a subprocess.
-/// Each subprocess gets fresh NSScreen state (not cached like in-process).
-/// Returns the ratio of peak HDR brightness to current SDR brightness.
-/// EDR > 8.0 = XDR mode, 1.0-8.0 = SDR mode on XDR panel, 1.0 = non-XDR.
-/// ~370ms per call; should be called infrequently (every few seconds).
-pub fn read_edr_headroom() -> f32 {
-    let output = command_output_timeout(
-        "python3",
-        &[
-            "-c",
-            r#"
-import ctypes,ctypes.util
-ctypes.CDLL('/System/Library/Frameworks/AppKit.framework/AppKit')
-o=ctypes.CDLL(ctypes.util.find_library('objc'))
-o.objc_getClass.restype=ctypes.c_void_p;o.objc_getClass.argtypes=[ctypes.c_char_p]
-o.sel_registerName.restype=ctypes.c_void_p;o.sel_registerName.argtypes=[ctypes.c_char_p]
-m=ctypes.CFUNCTYPE(ctypes.c_void_p,ctypes.c_void_p,ctypes.c_void_p)(ctypes.cast(o.objc_msgSend,ctypes.c_void_p).value)
-mi=ctypes.CFUNCTYPE(ctypes.c_void_p,ctypes.c_void_p,ctypes.c_void_p,ctypes.c_long)(ctypes.cast(o.objc_msgSend,ctypes.c_void_p).value)
-f=ctypes.CFUNCTYPE(ctypes.c_double,ctypes.c_void_p,ctypes.c_void_p)(ctypes.cast(o.objc_msgSend,ctypes.c_void_p).value)
-# Why this is done:
-# Some macOS versions still transiently surface the probe process in Dock.
-# We force prohibited activation policy immediately to keep it background-only.
-app_cls=o.objc_getClass(b'NSApplication')
-if app_cls:
-    app=m(app_cls,o.sel_registerName(b'sharedApplication'))
-    if app:
-        mi(app,o.sel_registerName(b'setActivationPolicy:'),2) # NSApplicationActivationPolicyProhibited
-screen_cls=o.objc_getClass(b'NSScreen')
-s=m(screen_cls,o.sel_registerName(b'mainScreen'))
-if not s:
-    screens=m(screen_cls,o.sel_registerName(b'screens'))
-    if screens:
-        s=m(screens,o.sel_registerName(b'firstObject'))
-if s:
-    print(f(s,o.sel_registerName(b'maximumPotentialExtendedDynamicRangeColorComponentValue')))
-else:
-    print(1.0)
-"#,
-        ],
-        Duration::from_millis(1000),
-    );
-    match output {
-        Some(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            s.trim().parse::<f32>().unwrap_or(1.0)
+/// Classify the panel from its peak millinits into static SDR/HDR/XDR class.
+/// Thresholds: ≤500 nits → SDR, 501–999 → HDR, ≥1000 → XDR (Apple flagship mini-LED).
+pub fn classify_panel(max_nits: f32) -> PanelClass {
+    if max_nits >= 1000.0 {
+        PanelClass::Xdr
+    } else if max_nits > 500.0 {
+        PanelClass::Hdr
+    } else {
+        PanelClass::Sdr
+    }
+}
+
+/// Current refresh rate of the main display in Hz.
+/// Returns 0.0 if unavailable. Used to tag the display label as 60Hz / 120Hz
+/// or "ProMotion" when the panel supports variable refresh.
+pub fn read_display_refresh_hz() -> f32 {
+    unsafe {
+        let display = CGMainDisplayID();
+        let mode = CGDisplayCopyDisplayMode(display);
+        if mode.is_null() {
+            return 0.0;
         }
-        _ => 1.0,
+        let hz = CGDisplayModeGetRefreshRate(mode) as f32;
+        CGDisplayModeRelease(mode);
+        hz
+    }
+}
+
+/// Detect ProMotion support by checking if any available display mode reports a
+/// refresh rate above 119 Hz (M1 Pro/Max and newer XDR notebooks). Cached at
+/// startup since panel hardware doesn't change at runtime.
+pub fn read_supports_promotion() -> bool {
+    unsafe {
+        let display = CGMainDisplayID();
+        let arr = CGDisplayCopyAllDisplayModes(display, std::ptr::null());
+        if arr.is_null() {
+            return false;
+        }
+        let count = core_foundation_sys::array::CFArrayGetCount(arr);
+        let mut found = false;
+        for i in 0..count {
+            let mode = core_foundation_sys::array::CFArrayGetValueAtIndex(arr, i)
+                as CGDisplayModeRef;
+            if !mode.is_null() && CGDisplayModeGetRefreshRate(mode) >= 119.0 {
+                found = true;
+                break;
+            }
+        }
+        cf_utils::cf_release(arr as _);
+        found
+    }
+}
+
+/// Information about the active CoreDisplay Reference Mode (a.k.a. "Display
+/// Preset" in System Settings → Displays). This is the **dynamic** display mode
+/// the user has chosen, e.g. "Apple Display (P3-600 nits)", "HDR Video
+/// (P3-ST 2084)", "Photography (P3-D65)". Values reflect the current preset and
+/// update without process restart when the user switches modes.
+#[derive(Clone, Debug, Default)]
+pub struct DisplayPreset {
+    pub name: String,
+    pub max_sdr_nits: f32,
+    pub max_hdr_nits: f32,
+    pub max_edr_headroom: f32,
+}
+
+/// Query the active Reference Mode via CoreDisplay private API.
+/// Returns `None` if the framework or symbols can't be loaded (highly unlikely
+/// on Apple Silicon Macs, but kept defensive).
+pub fn read_display_preset() -> Option<DisplayPreset> {
+    let get_idx = (*CD_GET_ACTIVE_PRESET_FN
+        .get_or_init(|| load_core_display_fn(b"CoreDisplay_Display_GetActivePresetIndex\0")))?;
+    let copy_preset = (*CD_COPY_PRESET_FN
+        .get_or_init(|| load_core_display_fn(b"CoreDisplay_Display_CopyPreset\0")))?;
+    unsafe {
+        let display = CGMainDisplayID();
+        let idx = get_idx(display);
+        if idx < 0 {
+            return None;
+        }
+        let dict = copy_preset(display, idx);
+        if dict.is_null() {
+            return None;
+        }
+        let name = cf_utils::cfdict_get_string(dict, "PresetName").unwrap_or_default();
+        let max_sdr_nits =
+            cf_utils::cfdict_get_f64(dict, "PresetMaxSDRLuminance").unwrap_or(0.0) as f32;
+        let max_hdr_nits =
+            cf_utils::cfdict_get_f64(dict, "PresetMaxHDRLuminance").unwrap_or(0.0) as f32;
+        let max_edr_headroom =
+            cf_utils::cfdict_get_f64(dict, "PresetHostMaxPotentialEDRHeadroom").unwrap_or(0.0)
+                as f32;
+        cf_utils::cf_release(dict as _);
+        Some(DisplayPreset {
+            name,
+            max_sdr_nits,
+            max_hdr_nits,
+            max_edr_headroom,
+        })
     }
 }
 
@@ -989,11 +1084,21 @@ impl Sampler {
             )
         });
 
-        let shared = Arc::new(Mutex::new(Metrics {
+        // Pre-seed the active preset so the first display tick has a sane cap
+        // for the live-nits formula instead of falling back to panel_max_nits.
+        let initial_preset = read_display_preset();
+        let mut initial_metrics = Metrics {
             gpu_cores,
             dram_gb,
             ..Default::default()
-        }));
+        };
+        if let Some(p) = initial_preset {
+            initial_metrics.display.preset_name = p.name;
+            initial_metrics.display.preset_max_sdr_nits = p.max_sdr_nits;
+            initial_metrics.display.preset_max_hdr_nits = p.max_hdr_nits;
+            initial_metrics.display.preset_max_edr_headroom = p.max_edr_headroom;
+        }
+        let shared = Arc::new(Mutex::new(initial_metrics));
         let static_snapshot = StaticSnapshot {
             gpu_cores,
             dram_gb,
@@ -1015,10 +1120,23 @@ impl Sampler {
                 while running.load(Ordering::Relaxed) {
                     std::thread::sleep(dt);
                     if let Ok(cur) = ior.sample() {
+                        let backlight = ior.parse_backlight(&cur);
                         if let Some(ref p) = prev {
                             if let Ok(soc) = ior.parse_power(p, &cur) {
                                 if let Ok(mut mg) = m.lock() {
                                     mg.soc = soc;
+                                    let dpb = backlight.dpb_factor();
+                                    mg.display.dpb_factor = dpb;
+                                    // Treat anything materially above 1.0 as
+                                    // "HDR engaged"; the 1.05 threshold filters
+                                    // tiny fixed-point rounding noise around 1.0.
+                                    mg.display.hdr_active = dpb > 1.05;
+                                    // NOTE: AppleARMBacklight `MilliNits value`
+                                    // is published but doesn't update with the
+                                    // slider on Apple Silicon (it only refreshes
+                                    // on certain backlight events), so we don't
+                                    // use it for live nits. The display thread
+                                    // computes nits from the slider × preset cap.
                                 }
                             }
                         }
@@ -1132,22 +1250,73 @@ impl Sampler {
             }));
         }
 
-        // ── Display brightness ───────────────────────────────────────────
+        // ── Display brightness + class/refresh/ProMotion ─────────────────
+        // Static panel class is computed once from peak millinits. Refresh rate
+        // and ProMotion support are read from CGDisplay APIs (in-process, no
+        // subprocess). Together with `hdr_active` (live from IOReport DPB factor
+        // in the IOReport thread above) this fully replaces the old Python EDR
+        // subprocess that caused issue #9 Dock flashing.
         {
             let m = shared.clone();
             let cal_max_ma = read_backlight_max_current_ma();
+            let panel_class = classify_panel(max_nits);
+            let supports_promotion = read_supports_promotion();
             let running = running.clone();
             handles.push(std::thread::spawn(move || {
                 while running.load(Ordering::Relaxed) {
                     let brightness = read_display_brightness();
-                    let linear_br = read_display_linear_brightness();
                     let backlight_current = read_backlight_current();
+                    let refresh_hz = read_display_refresh_hz();
+                    let preset = read_display_preset();
                     if let Ok(mut mg) = m.lock() {
                         if let Some(br) = brightness {
                             mg.display.available = true;
                             mg.display.brightness_pct = br * 100.0;
                             mg.display.max_nits = max_nits;
-                            mg.display.nits = linear_br.unwrap_or(br) * max_nits;
+                            // Map the slider linearly to the active Reference
+                            // Mode's full peak (e.g. 1600 in "P3-1600",
+                            // 600 in "P3-600"). This matches the user's
+                            // mental model: slider 100% = mode's stated peak,
+                            // exactly the number shown in System Settings.
+                            //
+                            // We deliberately don't try to reflect the
+                            // SDR-vs-HDR-boost split: physically, an SDR
+                            // pixel at slider 100% in "P3-1600" tops out near
+                            // 600 nits and only HDR content can push to 1600
+                            // via DPB boost — but that's confusing UX. Apple's
+                            // own Settings UI labels the peak as the slider
+                            // ceiling, so we follow that convention.
+                            //
+                            // Limitation: AppleARMBacklight's `MilliNits` /
+                            // `MicroAmps` channels don't refresh on slider
+                            // movement on Apple Silicon (event-driven, often
+                            // stale for many seconds), so we can't use the
+                            // actual measured brightness for live display.
+                            // Thermal throttling on XDR mini-LED can also
+                            // reduce achievable nits ~10–15% under sustained
+                            // peak HDR, but we have no clean live signal for
+                            // that.
+                            let sdr_cap = if mg.display.preset_max_sdr_nits > 0.0 {
+                                mg.display.preset_max_sdr_nits
+                            } else {
+                                max_nits
+                            };
+                            let hdr_cap = if mg.display.preset_max_hdr_nits > 0.0 {
+                                mg.display.preset_max_hdr_nits.max(sdr_cap)
+                            } else {
+                                sdr_cap
+                            };
+                            mg.display.peak_nits = hdr_cap;
+                            mg.display.nits = br * hdr_cap;
+                            mg.display.panel_class = panel_class;
+                            mg.display.refresh_hz = refresh_hz;
+                            mg.display.supports_promotion = supports_promotion;
+                            if let Some(p) = preset {
+                                mg.display.preset_name = p.name;
+                                mg.display.preset_max_sdr_nits = p.max_sdr_nits;
+                                mg.display.preset_max_hdr_nits = p.max_hdr_nits;
+                                mg.display.preset_max_edr_headroom = p.max_edr_headroom;
+                            }
                             // Power from backlight current or linear estimate
                             mg.display.estimated_power_w =
                                 if let Some((cur_ua, max_ua)) = backlight_current {
@@ -1178,18 +1347,6 @@ impl Sampler {
                     std::thread::sleep(dt);
                 }
             }));
-        }
-
-        // ── Display EDR headroom (subprocess, every 5s) ─────────────────
-        {
-            let m = shared.clone();
-            let running = running.clone();
-            spawn_periodic(&mut handles, &running, Duration::from_secs(5), move || {
-                let edr = read_edr_headroom();
-                if let Ok(mut mg) = m.lock() {
-                    mg.display.edr_headroom = edr;
-                }
-            });
         }
 
         // ── Keyboard backlight ───────────────────────────────────────────

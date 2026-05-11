@@ -129,17 +129,61 @@ pub struct AdapterInfo {
     pub is_wireless: bool,
 }
 
+/// Static class of a display panel, derived from peak luminance.
+/// Set once at startup; doesn't change at runtime.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub enum PanelClass {
+    /// No HDR pipeline; ≤500 nits typical (Air, base 13" MBP, most external panels).
+    #[default]
+    Sdr,
+    /// HDR-capable but not Apple flagship XDR; 501–999 nits typical.
+    Hdr,
+    /// Apple XDR mini-LED panel; ≥1000 nits peak (14"/16" MBP Pro/Max, Pro Display XDR).
+    Xdr,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DisplayInfo {
     pub brightness_pct: f32,
     pub nits: f32,
+    /// Peak (calibrated) panel nits — corresponds to `BrightnessMilliNits.max`.
+    /// Static; reflects panel hardware capability, not current state.
     pub max_nits: f32,
     pub estimated_power_w: f32,
     pub available: bool,
     pub width_px: u32,
     pub height_px: u32,
     pub diagonal_inches: f32,
-    pub edr_headroom: f32,
+    /// Static panel classification derived from `max_nits` thresholds.
+    pub panel_class: PanelClass,
+    /// Current refresh rate in Hz (e.g. 60.0, 120.0, fractional ProMotion values).
+    pub refresh_hz: f32,
+    /// True if the panel supports ProMotion (variable refresh up to ~120Hz).
+    pub supports_promotion: bool,
+    /// HDR pipeline currently engaged — content on screen requesting EDR boost.
+    /// Derived from AppleARMBacklight `DPB factor` IOReport channel:
+    /// `factor > 1.05` (raw value > ~68813 in 16.16 fixed-point).
+    pub hdr_active: bool,
+    /// Raw `DPB factor` value as 16.16 fixed-point divided to a float (1.0 = no boost).
+    pub dpb_factor: f32,
+    /// User-selected Reference Mode name (e.g. "Apple Display (P3-600 nits)",
+    /// "HDR Video (P3-ST 2084)", "Photography (P3-D65)"). Updates dynamically
+    /// when the user changes the preset in System Settings → Displays. Empty
+    /// when the API isn't available (some macOS versions or display types).
+    pub preset_name: String,
+    /// Peak SDR luminance allowed by the active preset (nits).
+    pub preset_max_sdr_nits: f32,
+    /// Peak HDR luminance allowed by the active preset (nits). Equals
+    /// `preset_max_sdr_nits` for SDR-only presets like "P3-600".
+    pub preset_max_hdr_nits: f32,
+    /// Maximum EDR headroom permitted by the active preset (1.0 means no HDR
+    /// boost in this mode; e.g. 5.0 in "P3-600", up to 16.0 in "HDR Video").
+    pub preset_max_edr_headroom: f32,
+    /// Peak nits the active Reference Mode can reach (the "marketing" cap from
+    /// the preset name — 600 in "P3-600", 1600 in "P3-1600 nits", etc.).
+    /// Defaults to `preset_max_hdr_nits` if available, otherwise SDR cap.
+    /// This is what gets displayed as the "max" in `current/peak nits`.
+    pub peak_nits: f32,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

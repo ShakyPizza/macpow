@@ -24,6 +24,17 @@ const PIN_MARKER: &str = "▸ ";
 const HISTORY_LEN: usize = 240;
 const CHART_HEIGHT: u16 = 7;
 
+/// Strip the parenthesised variant suffix from a CoreDisplay preset name.
+/// `"Apple XDR Display (P3-1600 nits)"` → `"Apple XDR Display"`.
+/// `"Internet & Web (sRGB)"` → `"Internet & Web"`.
+/// Returns the input unchanged if it has no parenthesis.
+fn short_preset_name(full: &str) -> &str {
+    full.split_once('(')
+        .map(|(head, _)| head.trim_end())
+        .unwrap_or(full)
+        .trim()
+}
+
 const COL_FREQ: u16 = 10;
 const COL_TEMP: u16 = 16;
 const COL_CUR: u16 = 14;
@@ -1800,7 +1811,9 @@ impl App {
             rows.push(r);
         }
 
-        // ── Display (backlight from SMC PBwo/PDBR + IOReport DISP/DISPEXT)
+        // ── Display (backlight from SMC PBwo/PDBR + IOReport DISP/DISPEXT;
+        //   panel class from BrightnessMilliNits.max; HDR-active from
+        //   AppleARMBacklight DPB factor IOReport channel; refresh from CGDisplay.)
         {
             let has_pdbr = m.backlight_power_w > 0.0;
             let bl_w = if has_pdbr {
@@ -1811,14 +1824,46 @@ impl App {
             let disp_w = bl_w + s.display_soc.get() + s.display_ext.get();
             let disp_wh = w.backlight + w.display_soc + w.display_ext;
             let size_str = if m.display.diagonal_inches > 0.0 {
-                let mode = if m.display.edr_headroom > 8.0 {
-                    " XDR"
-                } else if m.display.edr_headroom > 1.0 {
-                    " SDR"
+                let mut parts: Vec<String> = vec![format!("{:.0}\"", m.display.diagonal_inches)];
+                // Prefer the active CoreDisplay Reference Mode name (dynamic,
+                // matches what user picks in System Settings → Displays). Fall
+                // back to the static SDR/HDR/XDR panel class on machines or
+                // displays where the preset API doesn't return a value.
+                //
+                // Apple's preset names are "Family (Variant)", e.g.
+                // "Apple XDR Display (P3-1600 nits)". The variant is encoded as
+                // colour space + peak nits, both of which we display
+                // separately, so we strip the parenthesised tail and keep the
+                // user-friendly family name only.
+                if !m.display.preset_name.is_empty() {
+                    parts.push(short_preset_name(&m.display.preset_name).into());
                 } else {
-                    ""
+                    let class = match m.display.panel_class {
+                        macpow::types::PanelClass::Sdr => "SDR",
+                        macpow::types::PanelClass::Hdr => "HDR",
+                        macpow::types::PanelClass::Xdr => "XDR",
+                    };
+                    parts.push(class.into());
+                }
+                // Current/peak nits — current is slider × SDR cap (or boosted
+                // toward HDR cap when HDR is engaged). Peak is the full preset
+                // capability (e.g. 1600 in "P3-1600 nits" mode), matching what
+                // the user sees in System Settings.
+                let peak = if m.display.peak_nits > 0.0 {
+                    m.display.peak_nits
+                } else {
+                    m.display.max_nits
                 };
-                format!(" {:.0}\"{}", m.display.diagonal_inches, mode)
+                if m.display.nits > 0.0 && peak > 0.0 {
+                    parts.push(format!("{:.0}/{:.0} nits", m.display.nits, peak));
+                }
+                if m.display.refresh_hz > 0.0 {
+                    parts.push(format!("{:.0}Hz", m.display.refresh_hz));
+                }
+                if m.display.hdr_active {
+                    parts.push(format!("HDR x{:.1}", m.display.dpb_factor));
+                }
+                format!(" {}", parts.join(" · "))
             } else {
                 String::new()
             };
@@ -3426,6 +3471,28 @@ mod tests {
             value_celsius: temp,
             stale: false,
         }
+    }
+
+    #[test]
+    fn short_preset_name_strips_parenthesised_variant() {
+        assert_eq!(
+            short_preset_name("Apple XDR Display (P3-1600 nits)"),
+            "Apple XDR Display"
+        );
+        assert_eq!(
+            short_preset_name("Apple Display (P3-600 nits)"),
+            "Apple Display"
+        );
+        assert_eq!(short_preset_name("HDR Video (P3-ST 2084)"), "HDR Video");
+        assert_eq!(
+            short_preset_name("PAL & SECAM Video (BT.601 EBU)"),
+            "PAL & SECAM Video"
+        );
+        assert_eq!(short_preset_name("Internet & Web (sRGB)"), "Internet & Web");
+        assert_eq!(short_preset_name("Photography (P3-D65)"), "Photography");
+        // No parenthesis — return as-is, trimmed.
+        assert_eq!(short_preset_name("Custom Preset"), "Custom Preset");
+        assert_eq!(short_preset_name(""), "");
     }
 
     const B62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
