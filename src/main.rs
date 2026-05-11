@@ -151,8 +151,8 @@ extern "C" fn sigint_handler(_: libc::c_int) {
 /// Dump every SMC key in the same format as `iSMC raw`, so the output can be
 /// diffed against existing dumps in `dkorunic/iSMC/reports/`.
 fn run_dump_smc() -> Result<()> {
-    let mut smc = macpow::smc::SmcConnection::open()
-        .map_err(|e| anyhow::anyhow!("SMC open failed: {e}"))?;
+    let mut smc =
+        macpow::smc::SmcConnection::open().map_err(|e| anyhow::anyhow!("SMC open failed: {e}"))?;
     let entries = smc.dump_all();
     if entries.is_empty() {
         eprintln!("SMC: no keys returned (kernel may have refused enumeration)");

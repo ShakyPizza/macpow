@@ -204,8 +204,8 @@ pub fn read_supports_promotion() -> bool {
         let count = core_foundation_sys::array::CFArrayGetCount(arr);
         let mut found = false;
         for i in 0..count {
-            let mode = core_foundation_sys::array::CFArrayGetValueAtIndex(arr, i)
-                as CGDisplayModeRef;
+            let mode =
+                core_foundation_sys::array::CFArrayGetValueAtIndex(arr, i) as CGDisplayModeRef;
             if !mode.is_null() && CGDisplayModeGetRefreshRate(mode) >= 119.0 {
                 found = true;
                 break;
@@ -252,9 +252,8 @@ pub fn read_display_preset() -> Option<DisplayPreset> {
             cf_utils::cfdict_get_f64(dict, "PresetMaxSDRLuminance").unwrap_or(0.0) as f32;
         let max_hdr_nits =
             cf_utils::cfdict_get_f64(dict, "PresetMaxHDRLuminance").unwrap_or(0.0) as f32;
-        let max_edr_headroom =
-            cf_utils::cfdict_get_f64(dict, "PresetHostMaxPotentialEDRHeadroom").unwrap_or(0.0)
-                as f32;
+        let max_edr_headroom = cf_utils::cfdict_get_f64(dict, "PresetHostMaxPotentialEDRHeadroom")
+            .unwrap_or(0.0) as f32;
         cf_utils::cf_release(dict as _);
         Some(DisplayPreset {
             name,
